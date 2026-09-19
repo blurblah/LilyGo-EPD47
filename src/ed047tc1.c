@@ -103,8 +103,8 @@ static void IRAM_ATTR push_cfg(epd_config_register_t *cfg)
 
 void IRAM_ATTR busy_delay(uint32_t cycles)
 {
-    volatile uint64_t counts = XTHAL_GET_CCOUNT() + cycles;
-    while (XTHAL_GET_CCOUNT() < counts) ;
+    uint32_t start = (uint32_t)XTHAL_GET_CCOUNT();
+    while (((uint32_t)XTHAL_GET_CCOUNT() - start) < cycles) ;
 }
 
 
