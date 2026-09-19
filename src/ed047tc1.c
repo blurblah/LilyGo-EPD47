@@ -242,6 +242,9 @@ void  epd_output_row(uint32_t output_time_dus)
 
 void epd_end_frame()
 {
+    // 마지막 행 전송이 끝나기 전에 출력 설정을 바꾸지 않는다.
+    while (i2s_is_busy()) ;
+
     config_reg.ep_output_enable = false;
     push_cfg(&config_reg);
     config_reg.ep_mode = false;

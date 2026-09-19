@@ -118,6 +118,8 @@ volatile uint8_t IRAM_ATTR *i2s_get_current_buffer()
 #else
 volatile uint8_t IRAM_ATTR *i2s_get_current_buffer()
 {
+    // 단일 버퍼는 이전 DMA 전송이 끝난 뒤에만 덮어쓸 수 있다.
+    while (!output_done) ;
     return buffer;
 }
 #endif

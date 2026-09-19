@@ -54,6 +54,7 @@ typedef struct
     Rect_t area;
     int32_t frame;
     DrawMode_t mode;
+    bool bw_interleaved;
 } OutputParams;
 
 /******************************************************************************/
@@ -73,9 +74,11 @@ static void write_row(uint32_t output_time_dus);
 /**
  * @brief skip a display row
  */
-static void skip_row(uint8_t pipeline_finish_time);
+static void skip_row(uint32_t pipeline_finish_time);
 
 static void IRAM_ATTR reset_lut(uint8_t *lut_mem, DrawMode_t mode);
+
+static void IRAM_ATTR reset_bw_lut(uint8_t *lut_mem);
 
 static void IRAM_ATTR update_LUT(uint8_t *lut_mem, uint8_t k, DrawMode_t mode);
 
@@ -89,6 +92,10 @@ static void IRAM_ATTR nibble_shift_buffer_right(uint8_t *buf, uint32_t len);
 static void IRAM_ATTR provide_out(OutputParams *params);
 
 static void IRAM_ATTR feed_display(OutputParams *params);
+
+static void IRAM_ATTR bw_provide_out_task(void *params);
+
+static void IRAM_ATTR bw_feed_display_task(void *params);
 
 static void epd_fill_circle_helper(int32_t x0, int32_t y0, int32_t r, int32_t corners, int32_t delta,
                             uint8_t color, uint8_t *framebuffer);
@@ -854,9 +861,104 @@ void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode)
     vSemaphoreDelete(feed_sem);
 }
 
+
+bool IRAM_ATTR epd_draw_bw_interleaved(Rect_t area, uint8_t *data)
+{
+    // 전체 폭의 정렬된 버퍼만 허용하며, 덧셈 대신 차로 높이를 검사한다.
+    if (data == NULL || ((uintptr_t)data & 3U) != 0 ||
+        area.x != 0 || area.width != EPD_WIDTH ||
+        area.y < 0 || area.y >= EPD_HEIGHT || area.height <= 0 ||
+        area.height > EPD_HEIGHT - area.y)
+    {
+        return false;
+    }
+    if (conversion_lut == NULL || output_queue == NULL)
+    {
+        return false;
+    }
+
+    SemaphoreHandle_t fetch_sem = xSemaphoreCreateBinary();
+    SemaphoreHandle_t feed_sem = xSemaphoreCreateBinary();
+    if (fetch_sem == NULL || feed_sem == NULL)
+    {
+        if (fetch_sem != NULL) vSemaphoreDelete(fetch_sem);
+        if (feed_sem != NULL) vSemaphoreDelete(feed_sem);
+        return false;
+    }
+
+    bool completed = false;
+    // 0=검정, 1=흰색, 2~F=무동작을 한 번 변환하고 각 극성만 통과시킨다.
+    reset_bw_lut(conversion_lut);
+    vTaskDelay(10);
+    for (uint8_t k = 0; k < 15; k++)
+    {
+        for (uint8_t phase = 0; phase < 2; phase++)
+        {
+            DrawMode_t mode = phase == 0 ? WHITE_ON_BLACK : BLACK_ON_WHITE;
+            OutputParams p1 = {
+                .area = area,
+                .data_ptr = data,
+                .frame = k,
+                .mode = mode,
+                .done_smphr = fetch_sem,
+                .bw_interleaved = true,
+            };
+            OutputParams p2 = {
+                .area = area,
+                .data_ptr = data,
+                .frame = k,
+                .mode = mode,
+                .done_smphr = feed_sem,
+                .bw_interleaved = true,
+            };
+            TaskHandle_t t1 = NULL, t2 = NULL;
+            if (xTaskCreatePinnedToCore(bw_provide_out_task, "bw_fetch", 8192,
+                                       &p1, 10, &t1, 0) != pdPASS)
+            {
+                goto cleanup;
+            }
+            if (xTaskCreatePinnedToCore(bw_feed_display_task, "bw_render", 8192,
+                                       &p2, 10, &t2, 1) != pdPASS)
+            {
+                // 통지 전에는 매개변수에 접근하지 않으므로 늦은 삭제에도 안전하다.
+                vTaskDelete(t1);
+                goto cleanup;
+            }
+            // 두 작업의 생성이 끝난 뒤에만 스택 매개변수·세마포어·큐를 사용한다.
+            xTaskNotifyGive(t1);
+            xTaskNotifyGive(t2);
+            xSemaphoreTake(fetch_sem, portMAX_DELAY);
+            xSemaphoreTake(feed_sem, portMAX_DELAY);
+            vTaskDelete(t1);
+            vTaskDelete(t2);
+            vTaskDelay(5);
+        }
+    }
+    completed = true;
+
+cleanup:
+    vSemaphoreDelete(fetch_sem);
+    vSemaphoreDelete(feed_sem);
+    return completed;
+}
+
 /******************************************************************************/
 /***        local functions                                                 ***/
 /******************************************************************************/
+
+static void IRAM_ATTR bw_provide_out_task(void *params)
+{
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    provide_out((OutputParams *)params);
+}
+
+
+static void IRAM_ATTR bw_feed_display_task(void *params)
+{
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    feed_display((OutputParams *)params);
+}
+
 
 static void write_row(uint32_t output_time_dus)
 {
@@ -870,7 +972,7 @@ static void write_row(uint32_t output_time_dus)
 }
 
 
-static void skip_row(uint8_t pipeline_finish_time)
+static void skip_row(uint32_t pipeline_finish_time)
 {
     // output previously loaded row, fill buffer with no-ops.
     if (skipping == 0)
@@ -908,6 +1010,24 @@ static void reorder_line_buffer(uint32_t *line_data)
     {
         uint32_t val = *line_data;
         *(line_data++) = val >> 16 | ((val & 0x0000FFFF) << 16);
+    }
+}
+
+
+static void IRAM_ATTR reset_bw_lut(uint8_t *lut_mem)
+{
+    for (uint32_t input = 0; input < (1U << 16); input++)
+    {
+        uint8_t output = 0;
+        for (uint32_t pixel = 0; pixel < 4; pixel++)
+        {
+            uint32_t value = (input >> (pixel * 4)) & 0xF;
+            if (value <= 1)
+            {
+                output |= (value + 1) << (pixel * 2);
+            }
+        }
+        lut_mem[input] = output;
     }
 }
 
@@ -994,12 +1114,14 @@ static void IRAM_ATTR provide_out(OutputParams *params)
     Rect_t area = params->area;
     uint8_t *ptr = params->data_ptr;
 
-    if (params->frame == 0)
+    if (!params->bw_interleaved)
     {
-        reset_lut(conversion_lut, params->mode);
+        if (params->frame == 0)
+        {
+            reset_lut(conversion_lut, params->mode);
+        }
+        update_LUT(conversion_lut, params->frame, params->mode);
     }
-
-    update_LUT(conversion_lut, params->frame, params->mode);
 
     if (area.x < 0)
     {
@@ -1094,8 +1216,19 @@ static void IRAM_ATTR feed_display(OutputParams *params)
         }
         uint8_t output[EPD_WIDTH / 2];
         xQueueReceive(output_queue, output, portMAX_DELAY);
-        calc_epd_input_4bpp((uint32_t *)output, epd_get_current_buffer(),
+        uint8_t *epd_input = epd_get_current_buffer();
+        calc_epd_input_4bpp((uint32_t *)output, epd_input,
                             params->frame, conversion_lut);
+        if (params->bw_interleaved)
+        {
+            // 기존 S3 변환 순서를 유지하고 현재 주사의 극성만 남긴다.
+            uint32_t mask = params->mode == WHITE_ON_BLACK ? 0xAAAAAAAAU : 0x55555555U;
+            uint32_t *words = (uint32_t *)epd_input;
+            for (uint32_t j = 0; j < EPD_LINE_BYTES / 4; j++)
+            {
+                words[j] &= mask;
+            }
+        }
         write_row(contrast_lut[params->frame]);
     }
     if (!skipping)

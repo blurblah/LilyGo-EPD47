@@ -159,6 +159,19 @@ void IRAM_ATTR epd_draw_grayscale_image(Rect_t area, uint8_t *data);
  */
 void IRAM_ATTR epd_draw_image(Rect_t area, uint8_t *data, DrawMode_t mode);
 
+/**
+ * @brief 각 단계에서 흰색 다음 검정을 주사한다. 15단계 총 30회이며 완전 동시 구동은 아니다.
+ *
+ * @param area x=0, width=EPD_WIDTH이고 화면 안에 있는 양의 높이 영역만 허용한다.
+ * @param data 4바이트 정렬된 4bpp 버퍼. 짝수 x는 하위 nibble이며,
+ *             0=검정, 1=흰색, 2~F=무동작이다. 행당 EPD_WIDTH/2바이트가 필요하다.
+ * @return 완료하면 true, 입력·초기화 상태·자원 생성 실패 시 false.
+ *         자원 실패 전 일부 주사가 끝났을 수 있다. 드라이버 내부 대기는 제한하지 않는다.
+ * @note epd_init와 전원 켜기를 먼저 수행하고 반환 후 전원을 끈다.
+ *       다른 그리기 함수와 동시에 호출하지 말고 반환 전까지 버퍼를 변경하지 않는다.
+ */
+bool IRAM_ATTR epd_draw_bw_interleaved(Rect_t area, uint8_t *data);
+
 void IRAM_ATTR epd_draw_frame_1bit(Rect_t area, uint8_t *ptr, DrawMode_t mode, int32_t time);
 
 /**
