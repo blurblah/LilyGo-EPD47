@@ -209,7 +209,8 @@ static bool notify_trans_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_
 {
     // gpio_set_level(start_pulse_pin, 1);
     output_done = true;
-    return output_done;
+    // 반환값은 전송 완료 여부가 아니라 이 콜백이 태스크를 깨웠는지다.
+    return false;
 }
 #endif
 
